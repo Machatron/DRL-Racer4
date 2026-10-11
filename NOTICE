@@ -1,0 +1,21 @@
+DRL Racer4
+Copyright (c) 2026 hackrfstuff, Mr-Milky-Way, ZionFPV, Mayan Hawk and contributors.
+
+The original code, documentation and modifications in this project are
+licensed under the GNU Affero General Public License, version 3 only
+(AGPL-3.0-only). The full text is in LICENSE, or DRL-LICENSE.txt in the
+Configurator installation.
+
+Upstream Betaflight firmware and Configurator code remain under GPLv3.
+Their license is included separately. Existing copyright and license
+notices in upstream code still apply.
+
+omggif is MIT licensed by Dean McNamee. Its notice is in omggif.js.
+nlohmann/json is MIT licensed by Niels Lohmann. Its notice is in json.LICENSE.
+NW.js and its dependencies retain the notices supplied with Configurator.
+STM32CubeProgrammer and its USB driver retain ST's SLA0048 and the bundled
+third-party notices in the programmer's licenses directory.
+
+Stock DRL firmware dumps, the stock code within patched images and the
+original Racer3 animation artwork are not covered by this license grant.
+Their rights remain with their respective owners.

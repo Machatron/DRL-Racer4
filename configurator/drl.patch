@@ -74,7 +74,7 @@ index d7affa2fb4e197a5e9096f78da953aff81e89265..b7596e01987669b69f16ffd1fdbf1bff
    FunctionEnd
  
 diff --git a/assets/windows/installer.nsi b/assets/windows/installer.nsi
-index 70ea1bc362db6d6de1728eccce414a02639c9f57..8bb9715eae9a92d9eb6cc9925ad76de1b0064639 100644
+index 70ea1bc362db6d6de1728eccce414a02639c9f57..e4a92fb355a9fb5e68503f7e05325dad40414a9e 100644
 --- a/assets/windows/installer.nsi
 +++ b/assets/windows/installer.nsi
 @@ -6,21 +6,24 @@
@@ -100,7 +100,8 @@ index 70ea1bc362db6d6de1728eccce414a02639c9f57..8bb9715eae9a92d9eb6cc9925ad76de1
 +!define FILE_NAME_INSTALLER   "Betaflight-DRL.exe"
  !define FILE_NAME_UNINSTALLER "uninstall-betaflight-configurator.exe"
  !define FILE_NAME_EXECUTABLE  "betaflight-configurator.exe"
- !define LICENSE               "..\..\LICENSE"
+-!define LICENSE               "..\..\LICENSE"
++!define LICENSE               "${APP_SOURCE}\DRL-LICENSE.txt"
  !define MUI_WELCOMEFINISHPAGE_BITMAP ".\bf_installer.bmp"
  
  
@@ -109,7 +110,7 @@ index 70ea1bc362db6d6de1728eccce414a02639c9f57..8bb9715eae9a92d9eb6cc9925ad76de1
  Name "${APP_NAME}"
  BrandingText "${COMPANY_NAME}"
  
-@@ -32,10 +35,10 @@ BrandingText "${COMPANY_NAME}"
+@@ -32,14 +35,14 @@ BrandingText "${COMPANY_NAME}"
  !define UninstName "uninbf00"
  
  # Request rights user level
@@ -122,6 +123,11 @@ index 70ea1bc362db6d6de1728eccce414a02639c9f57..8bb9715eae9a92d9eb6cc9925ad76de1
  
  # app dialogs
  !insertmacro MUI_PAGE_WELCOME
+-!insertmacro MUI_PAGE_LICENSE ${LICENSE}
++!insertmacro MUI_PAGE_LICENSE "${LICENSE}"
+ !insertmacro MUI_PAGE_DIRECTORY
+ !insertmacro MUI_PAGE_INSTFILES
+ 
 @@ -64,48 +67,14 @@ OutFile "..\..\${DEST_FOLDER}\${FILE_NAME_INSTALLER}"
  !insertmacro MUI_LANGUAGE "Swedish"
  

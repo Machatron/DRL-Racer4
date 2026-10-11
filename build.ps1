@@ -165,6 +165,8 @@ function Build-Firmware {
     foreach ($Script in @('build_ec.py', 'build_ledc.py', 'package.py')) {
         Invoke-Tool python @("$Root/firmware/tools/$Script")
     }
+    Copy-Item -LiteralPath "$Root/LICENSE", "$Root/NOTICE" -Destination "$Root/firmware/build/releases" -Force
+    Copy-Item -LiteralPath "$Root/flasher/third_party/betaflight.LICENSE" -Destination "$Root/firmware/build/releases/Betaflight-LICENSE.txt" -Force
 }
 
 function Build-Configurator {
@@ -193,6 +195,8 @@ function Build-Configurator {
     Copy-Tree "$Source/locales" "$Destination/_locales"
     Copy-Item -LiteralPath "$Source/package.json" -Destination "$Destination/package.json" -Force
     Copy-Item -LiteralPath "$Source/LICENSE" -Destination "$Destination/LICENSE" -Force
+    Copy-Item -LiteralPath "$Root/LICENSE" -Destination "$Destination/DRL-LICENSE.txt" -Force
+    Copy-Item -LiteralPath "$Root/NOTICE" -Destination "$Destination/DRL-NOTICE.txt" -Force
     Write-Json "$Destination/version.json" @{
         version = '10.6.0'
         gitChangesetId = "DRL $Version $($Revision.Substring(0, 7))" + $(if ($Modified) { ' modified' })
@@ -284,8 +288,10 @@ function Build-Flasher {
     finally { $env:PATH = $RuntimePath }
     [IO.Directory]::CreateDirectory("$Destination/licenses") | Out-Null
     Copy-Item -LiteralPath "$Source/third_party/json.LICENSE" -Destination "$Destination/licenses/json.LICENSE" -Force
+    Copy-Item -LiteralPath "$Source/third_party/betaflight.LICENSE" -Destination "$Destination/licenses/betaflight.LICENSE" -Force
+    Copy-Item -LiteralPath "$Root/LICENSE", "$Root/NOTICE" -Destination $Destination -Force
     [IO.Directory]::CreateDirectory("$Source/dist") | Out-Null
-    $PackageFiles = @("$Destination/DRL Flasher.exe", "$Destination/builds", "$Destination/tools", "$Destination/licenses")
+    $PackageFiles = @("$Destination/DRL Flasher.exe", "$Destination/builds", "$Destination/tools", "$Destination/licenses", "$Destination/LICENSE", "$Destination/NOTICE")
     Compress-Archive -LiteralPath $PackageFiles -DestinationPath "$Source/dist/DRL Flasher.zip" -CompressionLevel Optimal -Force
     Write-Host "Built $Destination/DRL Flasher.exe"
     Write-Host "Packaged $Source/dist/DRL Flasher.zip"

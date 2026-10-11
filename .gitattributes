@@ -2,7 +2,11 @@
 *.bin binary
 *.gif binary
 *.png binary
+*.jpg binary
 *.uf2 binary
 *.hex text eol=lf
 *.patch text eol=lf
 *.gbf binary
+LICENSE text eol=lf
+NOTICE text eol=lf
+*.LICENSE text eol=lf
