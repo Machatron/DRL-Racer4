@@ -1,5 +1,9 @@
 #pragma once
 #include "core.hpp"
+#include "osd.hpp"
+#include "samba.hpp"
+#include "font_applet.hpp"
+#include "prompts.hpp"
 #include <setupapi.h>
 #include <devguid.h>
 #include <shlobj.h>
@@ -21,23 +25,6 @@ inline fs::path reportRoot()
     CoTaskMemFree(p);
     fs::create_directories(r);
     return r;
-}
-inline Json latestReport(const fs::path &root)
-{
-    std::vector<fs::path> reports;
-    for (auto &entry : fs::directory_iterator(root))
-    {
-        auto name = entry.path().filename().u8string();
-        if (name.size() == 20 && name[8] == 'T' && name[15] == '_' && name[19] == 'Z' &&
-            entry.is_directory() && fs::exists(entry.path() / L"report.json"))
-            reports.push_back(entry.path() / L"report.json");
-    }
-    if (!reports.empty())
-    {
-        std::sort(reports.rbegin(), reports.rend());
-        return jsonRead(reports.front());
-    }
-    return fs::exists(root / L"latest.json") ? jsonRead(root / L"latest.json") : Json();
 }
 inline std::vector<fs::path> bootDrives()
 {
@@ -297,27 +284,32 @@ struct Session
     Json catalog, profile, known, report;
     Bytes before, expected, payload;
     bool defaults = false, fc = false;
+    bool restoring = false;
+    Backup backup;
     std::string serial;
     std::function<void(std::string, int)> update;
+    fs::path file(const std::string &name) const
+    {
+        return reportFile(folder, report, name);
+    }
     void state(const std::string &s, const std::string &message, int percent)
     {
         report["state"] = s;
         report["message"] = message;
         report["progress"] = percent;
+        report["progress_scope"] = "step";
         report["updated_utc"] = stamp();
         jsonWrite(folder / L"report.json", report);
-        // Recovery reads the session report if the summary file is locked.
-        tryJsonWrite(root / L"latest.json", report);
         std::ofstream log(folder / L"events.log", std::ios::app);
         log << stamp() << " " << s << " " << message << "\n";
         if (update)
             update(message, percent);
     }
-    void start(const fs::path &pkg, const Json &cat, const std::string &key, bool reset)
+    void start(const AppSession &app, const fs::path &pkg, const Json &cat,
+               const std::string &key, bool reset)
     {
-        root = reportRoot();
-        folder = root / fs::u8path(stamp());
-        fs::create_directory(folder);
+        root = app.root;
+        folder = app.nextOperation(key);
         package = pkg;
         catalog = cat;
         profile = key == "LED_AUTO" ? Json{{"kind", "led_auto"}}
@@ -328,18 +320,137 @@ struct Session
         fc = profile.at("kind") == "fc" || profile.at("kind") == "fc_auto";
         if (fc)
             cube();
-        report = {{"schema", 1},
-                  {"session", folder.u8string()},
+        report = {{"schema", 3},
+                  {"session", app.folder.u8string()},
+                  {"operation_folder", folder.u8string()},
                   {"build", cat.at("name")},
                   {"profile", key},
                   {"settings", reset ? "build_defaults" : "keep_current"},
                   {"write_started", false},
                   {"verified", false}};
         report["requested_profile"] = key;
+        report["package"] = pkg.u8string();
         jsonWrite(folder / L"catalog.json", cat);
-        state("checking", "Checking build files", 2);
+        state("checking", "Checking build files", -1);
+        if (key.rfind("EC_", 0) == 0)
+        {
+            for (auto layout : {"original", "betaflight"})
+            {
+                auto font = parseFont(verifiedFile(pkg, cat.at("fonts").at(layout)));
+                write(file(std::string("font_") + layout + ".bin"), font);
+                report["font_assets"][layout] = hash(font);
+            }
+        }
         if (key != "LED_AUTO" && key != "FC_AUTO" && key != "EC_AUTO")
             payload = verifiedFile(pkg, profile.at("image"));
+    }
+    void restore(const AppSession &app, const fs::path &pkg, const Json &cat, const Backup &saved)
+    {
+        start(app, pkg, cat, saved.key, false);
+        backup = saved;
+        restoring = true;
+        report["operation"] = "restore";
+        report["restore_source"] = saved.file.u8string();
+        report["restore_sha256"] = hash(saved.image);
+        report["settings"] = "backup";
+        state("restore_connect", stepText(Step::Connect, profile.at("kind"), true), 0);
+    }
+    void queueFont(const std::string &layout)
+    {
+        require(profile.at("kind") == "ec", "Font programming belongs to the EC operation.");
+        auto font = restoring && layout == "backup" ? backup.fontData
+                                                    : read(file("font_" + layout + ".bin"));
+        require(hash(font) == (layout == "backup" ? Json(backup.fontHash)
+                                                  : report.at("font_assets").at(layout)),
+                "Bundled font changed.");
+        write(file("font_expected.bin"), font);
+        report["font_layout"] = layout;
+        report["font_expected_sha256"] = hash(font);
+        report["font_verified"] = false;
+        report["font_before_restore"] = false;
+        report["font_pending"] = true;
+        state("awaiting_font", stepText(Step::Font, profile.at("kind"), restoring), 0);
+    }
+    void uploadFont()
+    {
+        require(profile.at("kind") == "ec", "Font programming belongs to the EC operation.");
+        auto expectedFont = read(file("font_expected.bin"));
+        require(hash(expectedFont) == report.at("font_expected_sha256"), "Font file changed.");
+        require(report.value("verified", false), "Verify the EC firmware before the font step.");
+        state("font_connecting", "Connecting to the OSD", -1);
+        require(!bootDrives().empty(), "Double press EC RESET, then retry the font step.");
+        drive = oneDrive();
+        require(ufRead("font_firmware") == expected,
+                "EC firmware changed since verification. Check the connected board.");
+        auto devices = ports();
+        require(devices.size() == 1, "Connect only EC USB with battery power connected.");
+        report["font_transport"] = "ec_bootloader_ram";
+        report["font_bootloader"] = fontBootloader(expected);
+        report["font_helper_sha256"] = hash(Bytes(FontApplet, FontApplet + sizeof(FontApplet)));
+        BootFont connection(devices.front().name, expected,
+                            Bytes(FontApplet, FontApplet + sizeof(FontApplet)));
+        connection.request(2);
+        auto readGlyph = [&](uint8_t index) { return connection.readGlyph(index); };
+        auto readFont = [&](const std::string &phase, const std::string &label)
+        {
+            state(phase, label, 0);
+            Bytes result;
+            for (unsigned index = 0; index < 256; ++index)
+            {
+                auto glyph = readGlyph(index);
+                result.insert(result.end(), glyph.begin(), glyph.end());
+                if ((index + 1) % 16 == 0)
+                    state(phase, label + " " + std::to_string(index + 1) + " / 256", (index + 1) * 100 / 256);
+            }
+            return result;
+        };
+        auto installed = readFont("font_check", "Reading OSD font");
+        report["font_unchanged"] = installed == expectedFont;
+        report["font_write_attempts"] = 0;
+        if (installed != expectedFont && !fs::exists(file("font_before.bin")))
+        {
+            require(installed == readFont("font_backup", "Checking font backup"),
+                    "The two font backups differ. Nothing written to the OSD.");
+            write(file("font_before.bin"), installed);
+            report["font_before_sha256"] = hash(installed);
+            exportBackups(folder, report);
+            state("font_backup_saved", "OSD font backup saved", 100);
+        }
+        else if (fs::exists(file("font_before.bin")))
+            require(hash(read(file("font_before.bin"))) == report.at("font_before_sha256"),
+                    "The saved font backup changed.");
+        auto writeGlyph = [&](uint8_t index, const Bytes &glyph)
+        {
+            report["font_write_attempts"] = report.at("font_write_attempts").get<unsigned>() + 1;
+            connection.writeGlyph(index, glyph);
+        };
+        auto after = installed;
+        if (installed == expectedFont)
+            state("font_unchanged", "OSD font already correct", 100);
+        else
+        {
+            state("font_writing", "Writing OSD font", 0);
+            after = programFont(expectedFont, readGlyph, writeGlyph, [&](unsigned count)
+            {
+                if (count % 16 == 0)
+                    state("font_writing", "Writing OSD font " + std::to_string(count) + " / 256", count * 100 / 256);
+                if (count == 256)
+                    state("font_verifying", "Verifying OSD font", 0);
+            }, installed, [&](unsigned count)
+            {
+                if (count % 16 == 0)
+                    state("font_verifying", "Verifying OSD font " + std::to_string(count) + " / 256", count * 100 / 256);
+            });
+        }
+        write(file("font_after.bin"), after);
+        report["font_readback_sha256"] = hash(after);
+        state("font_final_check", "Checking EC flash", -1);
+        require(ufRead("font_final_firmware") == expected,
+                "EC flash differs after the font operation. Keep the backup in Reports.");
+        report["font_verified"] = true;
+        report["font_pending"] = false;
+        exportBackups(folder, report);
+        state("complete", stepText(Step::Complete, profile.at("kind"), restoring), 100);
     }
     std::string run(const std::string &label, const std::vector<std::wstring> &tail)
     {
@@ -358,21 +469,21 @@ struct Session
         auto a = read(drive / L"CURRENT.UF2");
         auto b = read(drive / L"CURRENT.UF2");
         require(a == b, "Two flash reads differ. Check the cable and retry.");
-        write(folder / fs::u8path(name + ".uf2"), a);
+        write(file(name + ".uf2"), a);
         return decodeUF2(a);
     }
     void prepare()
     {
-        state("backing_up", "Reading the board twice", 10);
+        state("backing_up", "Reading the board twice", -1);
         if (fc)
         {
             auto list = process(cube(), {L"-l", L"usb"}, folder / L"devices.log");
             if (list.find("Serial number") == std::string::npos && dfuConnected())
             {
-                state("usb_driver", "Installing USB driver. Accept the Windows prompt.", 5);
+                state("usb_driver", "Installing USB driver. Accept the Windows prompt.", -1);
                 installDfuDriver();
                 list = process(cube(), {L"-l", L"usb"}, folder / L"devices_after_driver.log");
-                state("backing_up", "Reading the board twice", 10);
+                state("backing_up", "Reading the board twice", -1);
             }
             auto pos = list.find("Serial number");
             require(pos != std::string::npos &&
@@ -398,24 +509,24 @@ struct Session
                 require(report.at("profile") == detected,
                         "Connected FC does not match the selected F4/F7 hardware.");
             report["detected_hardware"] = detected.substr(3);
-            state("backing_up", "Reading the board twice", 10);
+            state("backing_up", "Reading the board twice", -1);
             size_t size = profile.at("flash_size");
             std::wstringstream ss;
             ss << L"0x" << std::hex << size;
             auto info = run("backup_1",
-                            {L"-u", L"0x08000000", ss.str(), (folder / L"before.bin").wstring()});
-            validateFC(info, profile, fs::file_size(folder / L"before.bin"));
+                            {L"-u", L"0x08000000", ss.str(), file("before.bin").wstring()});
+            validateFC(info, profile, fs::file_size(file("before.bin")));
             report["device_id"] = profile.at("device_id");
-            run("backup_2", {L"-u", L"0x08000000", ss.str(), (folder / L"second.bin").wstring()});
-            before = read(folder / L"before.bin");
-            require(before.size() == size && before == read(folder / L"second.bin"),
+            run("backup_2", {L"-u", L"0x08000000", ss.str(), file("second.bin").wstring()});
+            before = read(file("before.bin"));
+            require(before.size() == size && before == read(file("second.bin")),
                     "FC backup reads differ.");
         }
         else
         {
             drive = oneDrive();
             before = ufRead("before");
-            write(folder / L"before.bin", before);
+            write(file("before.bin"), before);
         }
         report["before_sha256"] = hash(before);
         if (profile.at("kind") == "ec_auto")
@@ -433,24 +544,35 @@ struct Session
             report["profile"] = key;
             report["detected_wiring"] = key.substr(4);
         }
-        if (fc)
+        if (profile.at("kind") == "ec")
+            report["font_bootloader"] = fontBootloader(before);
+        if (restoring)
+        {
+            expected = restoreImage(before, backup, catalog, report.at("profile"));
+            if (fc)
+                write(file("restore.bin"), expected);
+            else
+                write(file("update.uf2"), encodeUF2(expected));
+        }
+        else if (fc)
         {
             require(defaults, "FC flashing requires build defaults.");
             expected = fcExpected(before, payload, defaults);
-            write(folder / L"firmware.hex", payload);
+            write(file("firmware.hex"), payload);
         }
         else
         {
             known = identify(before, profile);
             report["detected_firmware"] = known.at("name");
             expected = mergeSAMD(before, payload, known, false);
-            write(folder / L"update.uf2", encodeUF2(expected));
-            write(folder / L"rollback.uf2", encodeUF2(before));
+            write(file("update.uf2"), encodeUF2(expected));
+            write(file("rollback.uf2"), encodeUF2(before));
         }
-        write(folder / L"expected.bin", expected);
+        write(file("expected.bin"), expected);
         report["expected_sha256"] = hash(expected);
-        report["backup_file"] = (folder / L"before.bin").u8string();
-        state("ready_to_flash", "Backup saved. Ready to flash.", 25);
+        report["backup_file"] = file("before.bin").u8string();
+        exportBackups(folder, report);
+        state("ready_to_flash", "Backup saved. Ready to flash.", -1);
     }
     void flash()
     {
@@ -460,8 +582,8 @@ struct Session
         {
             std::wstringstream ss;
             ss << L"0x" << std::hex << before.size();
-            run("prewrite", {L"-u", L"0x08000000", ss.str(), (folder / L"prewrite.bin").wstring()});
-            require(read(folder / L"prewrite.bin") == before,
+            run("prewrite", {L"-u", L"0x08000000", ss.str(), file("prewrite.bin").wstring()});
+            require(read(file("prewrite.bin")) == before,
                     "Board changed since backup. Check it again.");
         }
         else
@@ -470,30 +592,28 @@ struct Session
             require(ufRead("prewrite") == before, "Board changed since backup. Check it again.");
         }
         report["write_started"] = true;
-        state("writing", "Writing firmware. Keep power connected.", 40);
+        state("writing", "Writing firmware", -1);
         if (fc)
         {
-            run("program", {L"-w", (folder / L"firmware.hex").wstring(), L"-v"});
+            if (restoring)
+                run("restore", {L"-w", file("restore.bin").wstring(), L"0x08000000", L"-v"});
+            else
+                run("program", {L"-w", file("firmware.hex").wstring(), L"-v"});
             if (defaults)
             {
                 Bytes blank(0x4000, 255);
-                write(folder / L"settings_reset.bin", blank);
+                write(file("settings_reset.bin"), blank);
                 run("settings",
-                    {L"-w", (folder / L"settings_reset.bin").wstring(), L"0x08004000", L"-v"});
+                    {L"-w", file("settings_reset.bin").wstring(), L"0x08004000", L"-v"});
             }
             verify();
         }
         else
         {
             require(
-                CopyFileW((folder / L"update.uf2").c_str(), (drive / L"UPDATE.UF2").c_str(), FALSE),
+                CopyFileW(file("update.uf2").c_str(), (drive / L"UPDATE.UF2").c_str(), FALSE),
                 "UF2 copy failed. Keep the backup and reopen the bootloader.");
-            state(
-                "awaiting_readback",
-                profile.at("kind") == "led"
-                    ? "Disconnect battery power for 5 seconds and reconnect, then click to verify."
-                    : "Double-press the EC RESET, then click to verify.",
-                70);
+            state("awaiting_readback", stepText(Step::Verify, profile.at("kind"), restoring), 0);
         }
     }
     void verify()
@@ -503,27 +623,27 @@ struct Session
             auto devices = ports();
             require(devices.size() == 1, "Connect only the LEDC USB JST with battery power "
                                          "connected, then retry verification.");
-            state("entering_readback", "Entering bootloader...", 75);
+            state("entering_readback", "Entering bootloader...", -1);
             enterBootloader(devices[0].name, false);
             for (int i = 0; i < 40 && bootDrives().empty(); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             require(!bootDrives().empty(), "LEDC bootloader did not appear. Disconnect battery "
                                            "power for 5 seconds and reconnect, then retry.");
         }
-        state("verifying", "Reading back the complete flash", 85);
+        state("verifying", "Reading back the complete flash", -1);
         Bytes after;
         if (fc)
         {
             std::wstringstream ss;
             ss << L"0x" << std::hex << before.size();
-            run("readback", {L"-u", L"0x08000000", ss.str(), (folder / L"after.bin").wstring()});
-            after = read(folder / L"after.bin");
+            run("readback", {L"-u", L"0x08000000", ss.str(), file("after.bin").wstring()});
+            after = read(file("after.bin"));
         }
         else
         {
             drive = oneDrive();
             after = ufRead("after");
-            write(folder / L"after.bin", after);
+            write(file("after.bin"), after);
         }
         report["readback_sha256"] = hash(after);
         require(after == expected, "Readback differs from the prepared image. Keep the board in "
@@ -531,15 +651,15 @@ struct Session
         report["verified"] = true;
         if (fc)
         {
-            state("verified", "Flash verified. Starting the FC.", 100);
+            state("verified", "Flash verified. Starting the FC.", -1);
             run("boot", {L"-g", L"0x08000000"});
         }
-        state("complete",
-              fc ? "Verified. Reconnect Betaflight USB, then check settings."
-              : profile.at("kind") == "led" ? "Verified. Disconnect battery power for 5 seconds "
-                                              "and reconnect to start the LEDC."
-                                            : "Verified. Press EC RESET once to start the board.",
-              100);
+        if (profile.at("kind") == "ec")
+        {
+            queueFont(restoring ? backup.font : "betaflight");
+            return;
+        }
+        state("complete", stepText(Step::Complete, profile.at("kind"), restoring), 100);
     }
     void fail(const std::string &message)
     {

@@ -295,6 +295,10 @@ inline bool matchesPendingProfile(const std::string &selection, const Json &repo
         return profile == selection;
     if (selection == "EC_AUTO")
         return profile == "EC_F4" || profile == "EC_F7";
+    if (selection == "LED_AUTO")
+        return profile == "LED_AB" || profile == "LED_C";
+    if (selection == "LED_AB" || selection == "LED_C")
+        return profile == selection;
     return report.value("requested_profile", profile) == selection;
 }
 inline void validateFC(const std::string &info, const Json &profile, size_t size)

@@ -4,4 +4,5 @@
 *.png binary
 *.uf2 binary
 *.hex text eol=lf
+*.patch text eol=lf
 *.gbf binary

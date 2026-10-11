@@ -3,7 +3,10 @@ param(
     [string]$Target = 'all',
     [string]$ArmToolchain = $env:ARM_TOOLCHAIN,
     [string]$Msys = 'C:\msys64',
-    [string]$ConfiguratorRuntime = ${env:ProgramFiles(x86)} + '\Betaflight\Betaflight-Configurator'
+    [string]$ConfiguratorRuntime = ${env:ProgramFiles(x86)} + '\Betaflight\Betaflight-Configurator',
+    [string]$AppVersion,
+    [string]$UpdateRepository = 'Open-DRL-Project/DRL-Racer4',
+    [switch]$UseGitHubCLI
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,7 +14,9 @@ if ($env:OS -ne 'Windows_NT') { throw 'This build requires Windows.' }
 $Root = $PSScriptRoot
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $Version = (Get-Content -LiteralPath "$Root/VERSION" -Raw).Trim()
+if ($AppVersion) { $Version = $AppVersion }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'VERSION must contain major.minor.patch.' }
+if ($UpdateRepository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid update repository.' }
 $Revision = 'unknown'
 $Modified = $true
 if (Test-Path -LiteralPath "$Root/.git") {
@@ -128,14 +133,19 @@ function Export-Patch {
     Write-Host "Exported $Folder/drl.patch"
 }
 
-function Build-Firmware {
+function Get-ArmToolchain {
     if (!$ArmToolchain) { $ArmToolchain = "$env:USERPROFILE/.platformio/packages/toolchain-gccarmnoneeabi" }
     $Arm = [IO.Path]::GetFullPath($ArmToolchain)
-    if (($Root + $Arm) -match '\s') { throw 'Betaflight requires repository and Arm toolchain paths without spaces.' }
     $Compiler = "$Arm/bin/arm-none-eabi-gcc.exe"
     if (!(Test-Path -LiteralPath $Compiler)) { throw 'Set -ArmToolchain to the GNU Arm 7 2017 q4 installation folder.' }
     $Version = & $Compiler --version
     if ($LASTEXITCODE -ne 0 -or ($Version -join "`n") -notmatch '7\.2\.1') { throw 'GNU Arm 7.2.1 is required.' }
+    return $Arm
+}
+
+function Build-Firmware {
+    $Arm = Get-ArmToolchain
+    if (($Root + $Arm) -match '\s') { throw 'Betaflight requires repository and Arm toolchain paths without spaces.' }
     $Source = Get-Source 'firmware/betaflight'
     $env:ARM_TOOLCHAIN = $Arm
     $env:PATH = "$Msys/usr/bin;$Msys/ucrt64/bin;$env:PATH"
@@ -189,9 +199,26 @@ function Build-Configurator {
         drlVersion = $Version
         sourceCommit = $Revision
         sourceModified = $Modified
+        updateRepository = $UpdateRepository
+        updateUseGitHubCLI = [bool]$UseGitHubCLI
     }
-    Copy-Item -LiteralPath "$Destination/betaflight-configurator.exe" -Destination "$Destination/Betaflight-DRL.exe"
-    Write-Host "Built $Destination/Betaflight-DRL.exe"
+    $Output = "$Root/configurator/build/output"
+    [IO.Directory]::CreateDirectory($Output) | Out-Null
+    $Nsis = "$Root/configurator/build/nsis-3.11"
+    if (!(Test-Path -LiteralPath "$Nsis/makensis.exe")) {
+        $Archive = "$Root/configurator/build/nsis-3.11.zip"
+        Invoke-Tool curl.exe @('--fail', '--location', '--silent', '--show-error', '--proto-redir', '=https',
+            'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip', '--output', $Archive)
+        if ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -ne 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1') {
+            throw 'NSIS download does not match version 3.11.'
+        }
+        Expand-Archive -LiteralPath $Archive -DestinationPath "$Root/configurator/build" -Force
+    }
+    Invoke-Tool "$Nsis/makensis.exe" @(
+        '/V2', "/DVERSION=$Version", '/DPLATFORM=win64', "/DAPP_SOURCE=$Destination",
+        "/DAPP_OUTPUT=$Output/Betaflight-DRL.exe", "$Source/assets/windows/installer.nsi"
+    )
+    Write-Host "Built $Output/Betaflight-DRL.exe"
 }
 
 function Build-Flasher {
@@ -200,12 +227,27 @@ function Build-Flasher {
     $Destination = "$Root/flasher/build"
     $Source = "$Root/flasher"
     [IO.Directory]::CreateDirectory($Destination) | Out-Null
+    $Arm = Get-ArmToolchain
+    Invoke-Tool "$Arm/bin/arm-none-eabi-gcc.exe" @(
+        '-Os', '-mthumb', '-mcpu=cortex-m4', '-ffreestanding', '-fno-builtin', '-fno-pic',
+        '-Wall', '-Wextra', '-Werror', '-nostdlib', "-Wl,-T,$Source/src/font_applet.ld",
+        '-Wl,--gc-sections', "$Source/src/font_applet.c", '-o', "$Destination/font_applet.elf"
+    )
+    Invoke-Tool "$Arm/bin/arm-none-eabi-objcopy.exe" @(
+        '-O', 'binary', "$Destination/font_applet.elf", "$Destination/font_applet.bin"
+    )
+    $AppletBytes = [IO.File]::ReadAllBytes("$Destination/font_applet.bin")
+    $AppletData = ($AppletBytes | ForEach-Object { '0x{0:x2}' -f $_ }) -join ','
+    [IO.File]::WriteAllText("$Destination/font_applet.hpp",
+        "#pragma once`nnamespace drl { inline constexpr unsigned char FontApplet[] = {$AppletData}; }`n", $Utf8)
     $ResourceVersion = $Version.Replace('.', ',') + ',0'
     $VersionHeader = @"
 #define DRL_VERSION "$Version"
 #define DRL_VERSION_RESOURCE $ResourceVersion
 #define DRL_SOURCE_COMMIT "$Revision"
 #define DRL_SOURCE_MODIFIED $([int]$Modified)
+#define DRL_UPDATE_REPOSITORY "$UpdateRepository"
+#define DRL_UPDATE_USE_GH $([int][bool]$UseGitHubCLI)
 "@
     [IO.File]::WriteAllText("$Destination/release.h", $VersionHeader, $Utf8)
     $Archive = "$Source/third_party/stm32cubeprogrammer-2.22.0.zip"
@@ -222,15 +264,17 @@ function Build-Flasher {
     Expand-Archive -LiteralPath $Archive -DestinationPath $Programmer
     Invoke-Tool "$Tools/windres.exe" @("$Source/src/app.rc", '-I', $Destination, '-O', 'coff', '-o', "$Destination/app.res") "$Source/src"
     $Flags = @('-std=c++17', '-O2', '-static', '-DUNICODE', '-D_UNICODE', '-D_WIN32_WINNT=0x0A00', '-I', $Destination)
-    $Libraries = @('bcrypt', 'setupapi', 'uuid', 'ole32', 'shell32', 'comctl32', 'comdlg32', 'uxtheme', 'gdi32', 'gdiplus', 'dwmapi') | ForEach-Object { "-l$_" }
+    $Libraries = @('bcrypt', 'setupapi', 'uuid', 'ole32', 'shell32', 'comctl32', 'comdlg32', 'uxtheme', 'gdi32', 'gdiplus', 'dwmapi', 'winhttp') | ForEach-Object { "-l$_" }
     Invoke-Tool "$Tools/g++.exe" ($Flags + @('-mwindows', '-municode', "$Source/src/main.cpp", "$Destination/app.res", '-o', "$Destination/DRL Flasher.exe") + $Libraries)
     foreach ($Program in @(@('pack', 'src/pack.cpp'), @('tests', 'tests/core_tests.cpp'))) {
         Invoke-Tool "$Tools/g++.exe" ($Flags + @("$Source/$($Program[1])", '-lbcrypt', '-o', "$Destination/$($Program[0]).exe"))
     }
     Invoke-Tool "$Destination/pack.exe" @("$Root/firmware", "$Destination/builds/local")
     Invoke-Tool "$Destination/tests.exe" @("$Root/firmware", "$Destination/builds/local")
+    Invoke-Tool "$Tools/g++.exe" ($Flags + @("$Source/tests/recovery_tests.cpp", '-lbcrypt', '-o', "$Destination/recovery_tests.exe"))
+    Invoke-Tool "$Destination/recovery_tests.exe" @("$Root/firmware", "$Destination/builds/local")
     Invoke-Tool "$Tools/g++.exe" ($Flags + @("$Source/tests/report_tests.cpp", '-o', "$Destination/report_tests.exe") + $Libraries)
-    Invoke-Tool "$Destination/report_tests.exe" @()
+    Invoke-Tool "$Destination/report_tests.exe" @("$Destination/builds/local")
     Invoke-Tool "$Tools/g++.exe" ($Flags + @("$Source/tests/runtime_tests.cpp", '-o', "$Destination/runtime_tests.exe") + $Libraries)
     $RuntimePath = $env:PATH
     try {

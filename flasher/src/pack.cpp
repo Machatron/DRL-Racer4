@@ -1,4 +1,4 @@
-#include "core.hpp"
+#include "recovery.hpp"
 #include "release.h"
 #include <iostream>
 using namespace drl;
@@ -37,6 +37,21 @@ int main(int argc, char **argv)
                                   m["size"]});
             return result;
         };
+        fs::create_directories(out / "fonts");
+        for (auto layout : {"original", "betaflight"})
+        {
+            auto path = std::string(layout) == "original" ? r / "baselines/osd.mcm"
+                : r.parent_path() / "configurator/files/resources/osd/1/drl.mcm";
+            auto raw = read(path);
+            parseFont(raw);
+            auto name = std::string("fonts/") + layout + ".mcm";
+            write(out / name, raw);
+            cat["fonts"][layout] = {{"file", name}, {"size", raw.size()}, {"sha256", hash(raw)}};
+        }
+        auto fontSignature = [&](const Bytes &data, const Json &mask, const char *layout)
+        {
+            return Json{{"hash", maskedHash(data, mask)}, {"mask", mask}, {"font", layout}};
+        };
         auto same = migration("EC_v25_F7_migration.json"),
              old = migration("EC_v25_F4_migration.json");
         Json ecMask = {{0, 0x4000}, {0x20000, 0x30000}},
@@ -63,6 +78,20 @@ int main(int argc, char **argv)
             list.push_back(known(read(out / ecImage["file"].get<std::string>()), "Unified EC v25",
                                  ecMask, same));
             cat["profiles"]["EC_" + target] = {{"kind", "ec"}, {"image", ecImage}, {"known", list}};
+            Json fonts = Json::array();
+            for (auto name : {"ec_v21.bin", "ec_v23.bin", "ec_v25.bin"})
+                fonts.push_back(fontSignature(read(r / "baselines" / name),
+                    std::string(name) == "ec_v21.bin" ? oldMask : ecMask, "original"));
+            for (auto &item : list)
+            {
+                bool stock = false;
+                for (auto &entry : fonts)
+                    stock |= entry.at("hash") == item.at("hash");
+                if (!stock)
+                    fonts.push_back({{"hash", item.at("hash")}, {"mask", item.at("mask")},
+                                     {"font", item.value("font", "betaflight")}});
+            }
+            cat["profiles"]["EC_" + target]["font_signatures"] = fonts;
             std::string file = target == "F7" ? "FC_RACER4S.hex" : "FC_RACER4F4.hex";
             auto fcImage = image(file);
             auto base = read(r / "baselines" / (target == "F7" ? "fc_f7.bin" : "fc_f4.bin"));

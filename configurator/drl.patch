@@ -1,3 +1,231 @@
+diff --git a/assets/windows/UnInst.nsh b/assets/windows/UnInst.nsh
+index d7affa2fb4e197a5e9096f78da953aff81e89265..b7596e01987669b69f16ffd1fdbf1bff02f11507 100644
+--- a/assets/windows/UnInst.nsh
++++ b/assets/windows/UnInst.nsh
+@@ -176,11 +176,10 @@ Var UNINST_DEL_FILE
+     Goto DoneUninstData
+ 
+   UninstData:
+-    FileOpen $Log "$UNINST_DAT" a
++    # Locate visits each path once. Avoid rescanning the log for every file.
++    FileOpen $Log "$UNINST_DAT" w
+     FileOpen $List "$Tmp" r
+ 
+-    FileRead $Log $1
+-    IfErrors 0 +2
+     FileWrite $Log "${UninstHeader}$\r$\n"
+ 
+     ${Locate} "$OUTDIR" "/L=FD" "${UninstallData_Func_CallBack}"
+@@ -213,20 +212,7 @@ Var UNINST_DEL_FILE
+     Goto LoopReadList
+ 
+     DoneReadList:
+-      FileSeek $Log 0 SET
+-
+-      LoopReadLog:
+-        FileRead $Log $1 ${NSIS_MAX_STRLEN}
+-        IfErrors DoneReadLog
+-
+-        ${TrimNewLines} $1 $R0
+-        StrCmp $R0 $R9 Done
+-
+-      Goto LoopReadLog
+-
+-      DoneReadLog:
+-        FileSeek $Log 0 END
+-        FileWrite $Log "$R9$\r$\n"
++      FileWrite $Log "$R9$\r$\n"
+ 
+     Done:
+       Push $0
+@@ -323,6 +309,8 @@ Var UNINST_DEL_FILE
+ 
+     DoneReadFile:
+       FileSeek $Log 0 SET
++      Push $2
++      StrCpy $2 0
+ 
+     LoopReadDIR:
+       FileRead $Log $1 ${NSIS_MAX_STRLEN}
+@@ -330,13 +318,22 @@ Var UNINST_DEL_FILE
+ 
+       ${TrimNewLines} $1 $R0
+ 
+-      IfFileExists $R0\*.* 0 +3
+-      RMDir $R0
+-      ClearErrors
++      IfFileExists "$R0\*.*" 0 LoopReadDIR
++      Push $R0
++      IntOp $2 $2 + 1
+ 
+     Goto LoopReadDIR
+ 
+     DoneReadDIR:
++      # Remove child directories before their parents.
++      IntCmp $2 0 FinishedDirectories
++      Pop $R0
++      RMDir "$R0"
++      IntOp $2 $2 - 1
++      Goto DoneReadDIR
++
++    FinishedDirectories:
++      Pop $2
+ 
+   FunctionEnd
+ 
+diff --git a/assets/windows/installer.nsi b/assets/windows/installer.nsi
+index 70ea1bc362db6d6de1728eccce414a02639c9f57..8bb9715eae9a92d9eb6cc9925ad76de1b0064639 100644
+--- a/assets/windows/installer.nsi
++++ b/assets/windows/installer.nsi
+@@ -6,21 +6,24 @@
+ # Receives variables from the command line
+ # ${VERSION} - Version to generate (x.y.z)
+ # ${PLATFORM} - Platform to generate (win32 or win64)
+-# ${DEST_FOLDER} - Destination folder for the installer files
++# ${APP_SOURCE} - Source folder for the application files
++# ${APP_OUTPUT} - Destination file for the installer
+ 
+ # Some definitions
+-!define SOURCE_FILES          "..\..\apps\betaflight-configurator\${PLATFORM}\*"
+-!define APP_NAME              "Betaflight Configurator"
+-!define COMPANY_NAME          "The Betaflight open source project."
+-!define GROUP_NAME            "Betaflight"
+-!define FOLDER_NAME           "Betaflight-Configurator"
+-!define FILE_NAME_INSTALLER   "betaflight-configurator-installer_${VERSION}_${PLATFORM}.exe"
++!define SOURCE_FILES          "${APP_SOURCE}\*"
++!define APP_NAME              "Betaflight-DRL"
++!define COMPANY_NAME          "DRL Racer4"
++!define GROUP_NAME            "DRL"
++!define FOLDER_NAME           "Betaflight-DRL"
++!define FILE_NAME_INSTALLER   "Betaflight-DRL.exe"
+ !define FILE_NAME_UNINSTALLER "uninstall-betaflight-configurator.exe"
+ !define FILE_NAME_EXECUTABLE  "betaflight-configurator.exe"
+ !define LICENSE               "..\..\LICENSE"
+ !define MUI_WELCOMEFINISHPAGE_BITMAP ".\bf_installer.bmp"
+ 
+ 
++Unicode true
++SetCompressor /SOLID lzma
+ Name "${APP_NAME}"
+ BrandingText "${COMPANY_NAME}"
+ 
+@@ -32,10 +35,10 @@ BrandingText "${COMPANY_NAME}"
+ !define UninstName "uninbf00"
+ 
+ # Request rights user level
+-RequestExecutionLevel highest
++RequestExecutionLevel user
+ 
+ # define the resulting installer's name:
+-OutFile "..\..\${DEST_FOLDER}\${FILE_NAME_INSTALLER}"
++OutFile "${APP_OUTPUT}"
+ 
+ # app dialogs
+ !insertmacro MUI_PAGE_WELCOME
+@@ -64,48 +67,14 @@ OutFile "..\..\${DEST_FOLDER}\${FILE_NAME_INSTALLER}"
+ !insertmacro MUI_LANGUAGE "Swedish"
+ 
+ # detect default install folder
+-Function .onInit
+-
+-    # Check if older version
+-    ReadRegStr $R0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+-            "InstallLocation"
+-
+-    ${If} $R0 != ""
+-        StrCpy $INSTDIR $R0
+-    ${Else}
+-
+-        # Check if older version without administrative rights
+-        ReadRegStr $R1 HKCU "Software\${GROUP_NAME}\${APP_NAME}" \
+-            "InstallLocation"
+-
+-        ${If} $R1 != ""
+-            StrCpy $INSTDIR $R1
+-        ${Else}
+-
+-            # New version, select default folder
+-            UserInfo::GetAccountType
+-            Pop $R2
+-            
+-            ${If} $R2 == "Admin"
+-                # set the default installation directory
+-                !if ${PLATFORM} == 'win64'
+-                        StrCpy $INSTDIR "$PROGRAMFILES64\${GROUP_NAME}\${FOLDER_NAME}\" 
+-                !else
+-                        StrCpy $INSTDIR "$PROGRAMFILES\${GROUP_NAME}\${FOLDER_NAME}\" 
+-                !endif
+-            ${Else}
+-                StrCpy $INSTDIR "$DOCUMENTS\${GROUP_NAME}\${FOLDER_NAME}\"
+-            ${Endif}
+-        ${Endif}
+-    ${Endif}
+-
+-FunctionEnd
++InstallDir "$LOCALAPPDATA\Programs\${GROUP_NAME}\${FOLDER_NAME}"
++InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "InstallLocation"
+ 
+ # default section start
+ Section
+ 
+-    # remove the older version, users with admin rights
+-    ReadRegStr $R3 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    # remove the older version
++    ReadRegStr $R3 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+             "InstallLocation"
+ 
+     ${If} $R3 != ""
+@@ -143,7 +112,7 @@ Section
+     !insertmacro UNINSTALLER_DATA_BEGIN
+ 
+     # specify the files to go in the output path
+-    File /r ${SOURCE_FILES}
++    File /r "${SOURCE_FILES}"
+ 
+     # create the uninstaller
+     WriteUninstaller "$INSTDIR\${FILE_NAME_UNINSTALLER}"
+@@ -158,17 +127,17 @@ Section
+     CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${FILE_NAME_EXECUTABLE}" "" "$INSTDIR\images\bf_icon.ico" "0" "" "" ""
+ 
+     # include in add/remove programs
+-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "Publisher" "${COMPANY_NAME}"
+-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "DisplayName" "${APP_NAME}"
+-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "DisplayIcon" "$\"$INSTDIR\${FILE_NAME_EXECUTABLE}$\""
+-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "UninstallString" "$\"$INSTDIR\${FILE_NAME_UNINSTALLER}$\""
+-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "InstallLocation" "$INSTDIR"
+-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "DisplayVersion" "${VERSION}"
+ 
+     # include for users without admin rights
+@@ -178,7 +147,7 @@ Section
+     # estimate the size
+     ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+     IntFmt $0 "0x%08X" $0
+-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
++    WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" \
+                 "EstimatedSize" "$0"
+ 
+ 
+@@ -206,7 +175,7 @@ Section "Uninstall"
+     Delete "$DESKTOP\${APP_NAME}.lnk"
+ 
+     # remove from registry
+-    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
++    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
+     DeleteRegKey HKCU "Software\${GROUP_NAME}\${APP_NAME}"
+     DeleteRegKey /ifempty HKCU "Software\${GROUP_NAME}"
+ 
 diff --git a/src/css/tabs/drl_led.css b/src/css/tabs/drl_led.css
 new file mode 100644
 index 0000000000000000000000000000000000000000..f024b36260776a43604a9137741af56881761c19
@@ -1036,10 +1264,20 @@ index f8d00412eafce13d67d72afb4ac7b28da0e1977e..f8c7331456eee075dfd7d64e23c05e1c
  // initialize object into GUI variable
  var GUI = new GUI_control();
 diff --git a/src/js/main.js b/src/js/main.js
-index 58b9b71034bd4793e3c1f7dab0f6769315d00e2c..5e93aa3a3c9b7e0251ce2382957a618970cac2a6 100644
+index 58b9b71034bd4793e3c1f7dab0f6769315d00e2c..4144d1deca9a9505b0898e626cd9ca2f1ade8384 100644
 --- a/src/js/main.js
 +++ b/src/js/main.js
-@@ -242,7 +242,16 @@ function startProcess() {
+@@ -7,6 +7,9 @@ $(document).ready(function () {
+     $.getJSON('version.json', function(data) {
+         CONFIGURATOR.version = data.version;
+         CONFIGURATOR.gitChangesetId = data.gitChangesetId;
++        CONFIGURATOR.drlVersion = data.drlVersion;
++        CONFIGURATOR.updateRepository = data.updateRepository;
++        CONFIGURATOR.updateUseGitHubCLI = data.updateUseGitHubCLI;
+ 
+         // Version in the ChromeApp's manifest takes precedence.
+         if(chrome.runtime && chrome.runtime.getManifest) {
+@@ -242,7 +245,16 @@ function startProcess() {
                          TABS.ports.initialize(content_ready);
                          break;
                      case 'led_strip':
@@ -1057,7 +1295,109 @@ index 58b9b71034bd4793e3c1f7dab0f6769315d00e2c..5e93aa3a3c9b7e0251ce2382957a6189
                          break;
                      case 'failsafe':
                          TABS.failsafe.initialize(content_ready);
-@@ -674,7 +683,14 @@ function updateTabList(features) {
+@@ -566,50 +578,61 @@ function setDarkTheme(enabled) {
+ }
+ 
+ function checkForConfiguratorUpdates() {
+-    var releaseChecker = new ReleaseChecker('configurator', 'https://api.github.com/repos/betaflight/betaflight-configurator/releases');
+-
+-    releaseChecker.loadReleaseData(notifyOutdatedVersion);
++    if (CONFIGURATOR.updateChecked || !semver.valid(CONFIGURATOR.drlVersion)) return;
++    var repository = CONFIGURATOR.updateRepository;
++    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) return;
++    CONFIGURATOR.updateChecked = true;
++    var endpoint = 'repos/' + repository + '/releases/latest';
++    if (CONFIGURATOR.updateUseGitHubCLI) {
++        var path = require('path');
++        var gh = path.join(process.env.ProgramW6432 || process.env.ProgramFiles, 'GitHub CLI', 'gh.exe');
++        require('child_process').execFile(gh, ['api', endpoint],
++            { windowsHide: true, timeout: 10000, maxBuffer: 262144 }, function (error, output) {
++                if (error) return;
++                try { notifyOutdatedVersion(JSON.parse(output)); } catch (e) {}
++            });
++    } else {
++        $.ajax({ url: 'https://api.github.com/' + endpoint, dataType: 'json', timeout: 10000 })
++            .done(notifyOutdatedVersion);
++    }
+ }
+ 
+-function notifyOutdatedVersion(releaseData) {
+-    ConfigStorage.get('checkForConfiguratorUnstableVersions', function (result) {
+-        var showUnstableReleases = false;
+-        if (result.checkForConfiguratorUnstableVersions) {
+-            showUnstableReleases = true;
+-        }
+-         var versions = releaseData.filter(function (version) {
+-             var semVerVersion = semver.parse(version.tag_name);
+-             if (semVerVersion && (showUnstableReleases || semVerVersion.prerelease.length === 0)) {
+-                 return version;
+-             }
+-         }).sort(function (v1, v2) {
+-            try {
+-                return semver.compare(v2.tag_name, v1.tag_name);
+-            } catch (e) {
+-                return false;
++function notifyOutdatedVersion(release) {
++    if (!release || release.draft || release.prerelease || !semver.valid(release.tag_name) ||
++        !semver.gt(release.tag_name, CONFIGURATOR.drlVersion)) return;
++    var dialog = $('.dialogConfiguratorUpdate')[0];
++    if (dialog.open) return;
++    var close = $('.dialogConfiguratorUpdate-closebtn');
++    var timer = null;
++    $('.dialogConfiguratorUpdate-content').text('You are using outdated firmware and tools for the DRL Racer4');
++    close.text('Close').removeClass('disabled');
++    function dismiss(event) {
++        event.preventDefault();
++        if (timer !== null) return;
++        var end = Date.now() + 5000;
++        close.text('5');
++        timer = setInterval(function () {
++            var remaining = Math.ceil((end - Date.now()) / 1000);
++            if (remaining <= 0) {
++                clearInterval(timer);
++                dialog.close();
++            } else {
++                close.text(remaining);
+             }
++        }, 100);
++    }
++    close.off('click.drlUpdate').on('click.drlUpdate', dismiss);
++    dialog.oncancel = dismiss;
++    dialog.onclose = function () {
++        if (timer !== null) clearInterval(timer);
++    };
++    $('.dialogConfiguratorUpdate-websitebtn').text('Go to Release Website')
++        .off('click.drlUpdate').on('click.drlUpdate', function (event) {
++            event.preventDefault();
++            require('nw.gui').Shell.openExternal('https://github.com/Open-DRL-Project/DRL-Racer4/releases');
++            dialog.close();
+         });
+-
+-        if (versions.length > 0 && semver.lt(CONFIGURATOR.version, versions[0].tag_name)) {
+-            GUI.log(i18n.getMessage('configuratorUpdateNotice', [versions[0].tag_name, versions[0].html_url]));
+-
+-            var dialog = $('.dialogConfiguratorUpdate')[0];
+-
+-            $('.dialogConfiguratorUpdate-content').html(i18n.getMessage('configuratorUpdateNotice', [versions[0].tag_name, versions[0].html_url]));
+-
+-            $('.dialogConfiguratorUpdate-closebtn').click(function() {
+-                dialog.close();
+-            });
+-
+-            $('.dialogConfiguratorUpdate-websitebtn').click(function() {
+-                dialog.close();
+-
+-                window.open(versions[0].html_url, '_blank');
+-            });
+-
+-            dialog.showModal();
+-        }
+-    });
++    dialog.showModal();
+ }
+ 
+ function update_packet_error(caller) {
+@@ -674,7 +697,14 @@ function updateTabList(features) {
          $('#tabs ul.mode-connected li.tab_gps').hide();
      }
  
@@ -1073,7 +1413,7 @@ index 58b9b71034bd4793e3c1f7dab0f6769315d00e2c..5e93aa3a3c9b7e0251ce2382957a6189
          $('#tabs ul.mode-connected li.tab_led_strip').show();
      } else {
          $('#tabs ul.mode-connected li.tab_led_strip').hide();
-@@ -698,7 +714,7 @@ function updateTabList(features) {
+@@ -698,7 +728,7 @@ function updateTabList(features) {
          $('#tabs ul.mode-connected li.tab_power').hide();
      }
  
@@ -2344,7 +2684,7 @@ index 929328e02bec6bf226dd30e6d084c36b21f202a8..f6e65e24d88da5145be06c482d83504a
      // Add here things that need to be cleaned or closed before leaving the tab
      this.vtxTableSavePending = false;
 diff --git a/src/main.html b/src/main.html
-index e34936deccf3e5acc2b904f2c24e934f7c1a8645..ac4a7c360af8fc646c57698499f5acbc02215c62 100644
+index e34936deccf3e5acc2b904f2c24e934f7c1a8645..5d77314b2a829e8e3c91f7e5f874bc5b44bcf5da 100644
 --- a/src/main.html
 +++ b/src/main.html
 @@ -130,6 +130,13 @@
@@ -2378,6 +2718,17 @@ index e34936deccf3e5acc2b904f2c24e934f7c1a8645..ac4a7c360af8fc646c57698499f5acbc
                  <li class="tab_led_strip"><a href="#" i18n="tabLedStrip" class="tabicon ic_led" i18n_title="tabLedStrip"></a>
                  </li>
                  <li class="tab_sensors"><a href="#" i18n="tabRawSensorData" class="tabicon ic_sensors"
+@@ -361,8 +371,8 @@
+             <div class="dialogConfiguratorUpdate-content" style="margin-top: 10px"></div>
+         </div>
+         <div class="buttons">
+-            <a href="#" class="dialogConfiguratorUpdate-websitebtn regular-button" i18n="configuratorUpdateWebsite"></a>
+-            <a href="#" class="dialogConfiguratorUpdate-closebtn regular-button" i18n="close"></a>
++            <a href="#" class="dialogConfiguratorUpdate-websitebtn regular-button"></a>
++            <a href="#" class="dialogConfiguratorUpdate-closebtn regular-button"></a>
+         </div>
+     </dialog>
+ 
 diff --git a/src/tabs/drl_led.html b/src/tabs/drl_led.html
 new file mode 100644
 index 0000000000000000000000000000000000000000..6288903fb1595093d3370e87ef370ce6d321fc0a

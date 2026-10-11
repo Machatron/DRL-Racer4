@@ -1,7 +1,6 @@
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
-#include <stdio.h>
 uint8_t test_osd_object[32];
 volatile uint8_t test_osd_debug = 2, test_osd_previous = 2;
 static uint8_t registers[256], nvm[256][54], shadow[54], display[480], ack[70];
@@ -279,6 +278,4 @@ int main(void)
     power_off = 1;
     send((uint8_t[]){2}, 1);
     assert(clears == 2);
-    puts("PASS: LED dispatch/validation/busy, glyphs, font verification/retries, absent rail, "
-         "reset busy, late power/recovery, PAL/NTSC, no NVM startup writes");
 }

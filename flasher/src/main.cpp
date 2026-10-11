@@ -1,4 +1,5 @@
 #include "platform.hpp"
+#include "updates.hpp"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <gdiplus.h>
@@ -13,19 +14,15 @@ HBRUSH background = CreateSolidBrush(RGB(255, 255, 255));
 std::unique_ptr<Gdiplus::Image> header;
 IStream *headerStream = nullptr;
 int dpi = 96, percent = 0;
-enum class Step
-{
-    Idle,
-    Connect,
-    Reset,
-    Verify,
-    Complete
-};
 Step step = Step::Idle;
 bool busy = false, failed = false;
 std::wstring caption = L"Flash";
 std::thread worker;
+std::thread updateWorker;
+bool updatePending = false;
+AppSession appSession;
 std::unique_ptr<Session> session;
+std::unique_ptr<Backup> restoreBackup;
 std::vector<fs::path> folders;
 std::vector<Json> catalogs;
 enum
@@ -38,9 +35,10 @@ enum
     REPORTS,
     BROWSE,
     BACK,
-    EC_CPU
+    EC_CPU,
+    RESTORE
 };
-constexpr UINT EVENT = WM_APP + 1, DONE = WM_APP + 2;
+constexpr UINT EVENT = WM_APP + 1, DONE = WM_APP + 2, UPDATE_AVAILABLE = WM_APP + 3;
 struct Update
 {
     std::wstring text;
@@ -88,6 +86,8 @@ void saveUI(bool running = true) noexcept
         Json j = {{"running", running},
                   {"pid", GetCurrentProcessId()},
                   {"busy", busy},
+                  {"progress", percent},
+                  {"progress_scope", "step"},
                   {"step", int(step)},
                   {"message", narrow(caption)},
                   {"updated_utc", stamp()},
@@ -98,7 +98,8 @@ void saveUI(bool running = true) noexcept
         int b = selection(buildBox);
         if (b >= 0 && size_t(b) < catalogs.size())
             j["build"] = catalogs[b]["name"];
-        tryJsonWrite(reportRoot() / L"ui.json", j);
+        j["session"] = appSession.folder.u8string();
+        tryJsonWrite(appSession.data() / L"ui.json", j);
     }
     catch (...)
     {
@@ -107,7 +108,7 @@ void saveUI(bool running = true) noexcept
 void refresh(bool persist = true)
 {
     bool idle = !busy && step == Step::Idle;
-    for (int id : {BUILD, BOARD, CPU, EC_CPU, LED, BROWSE})
+    for (int id : {BUILD, BOARD, CPU, EC_CPU, LED, BROWSE, RESTORE})
         EnableWindow(GetDlgItem(win, id), idle);
     bool led = selection(boardBox) == 2;
     ShowWindow(ledBox, led ? SW_SHOW : SW_HIDE);
@@ -129,6 +130,7 @@ void refresh(bool persist = true)
     EnableWindow(ecBox, idle && selection(boardBox) == 1);
     EnableWindow(flashButton, !busy && !folders.empty());
     ShowWindow(GetDlgItem(win, BACK), !busy && step != Step::Idle ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(win, RESTORE), step == Step::Idle ? SW_SHOW : SW_HIDE);
     SetWindowTextW(flashButton, caption.c_str());
     InvalidateRect(flashButton, nullptr, FALSE);
     if (persist)
@@ -137,36 +139,10 @@ void refresh(bool persist = true)
 void prompt()
 {
     failed = false;
-    switch (step)
-    {
-    case Step::Idle:
-        caption = L"Flash";
-        percent = 0;
-        break;
-    case Step::Connect:
-        caption = selection(boardBox) == 0
-                      ? L"Connect Betaflight USB\nwith battery power disconnected"
-                  : selection(boardBox) == 1
-                      ? L"Connect EC USB\nwith battery power disconnected"
-                      : L"Connect to LEDC USB JST\nand connect battery power";
-        break;
-    case Step::Reset:
-        caption = L"Double press the RESET button";
-        break;
-    case Step::Verify:
-        caption = selection(boardBox) == 2
-                      ? L"Disconnect battery power for 5 seconds\nand reconnect"
-                  : session && session->fc ? L"Connect Betaflight USB in bootloader mode"
-                                           : L"Double press the RESET button";
-        break;
-    case Step::Complete:
-        caption = selection(boardBox) == 2
-                      ? L"Flash complete\nDisconnect battery power for 5 seconds\nand reconnect"
-                  : session && session->fc ? L"Flash complete\nReconnect Betaflight USB"
-                                           : L"Flash complete\nPress RESET once to start the board";
-        percent = 100;
-        break;
-    }
+    auto kind = selection(boardBox) == 0 ? "fc" : selection(boardBox) == 1 ? "ec" : "led";
+    bool restoring = restoreBackup || (session && session->restoring);
+    caption = wide(stepText(step, kind, restoring));
+    percent = step == Step::Complete ? 100 : 0;
     refresh();
 }
 void notify(const std::string &text, int p)
@@ -178,6 +154,7 @@ void notify(const std::string &text, int p)
 template <class F> void run(F action, Step next)
 {
     busy = true;
+    percent = -1;
     caption = L"Connecting...";
     refresh();
     if (worker.joinable())
@@ -223,15 +200,15 @@ bool resumePending()
     auto report = latestReport(root);
     if (report.is_null())
         return false;
-    if (!report.value("write_started", false) || report.value("verified", false))
+    if ((!report.value("write_started", false) || report.value("verified", false)) &&
+        !report.value("font_pending", false) && report.value("state", "") != "restore_connect")
         return false;
     int b = selection(boardBox);
     auto key = selectedProfile();
     if (!matchesPendingProfile(key, report))
         return false;
-    auto folder = fs::u8path(report.at("session").get<std::string>());
-    require(fs::weakly_canonical(folder).parent_path() == fs::weakly_canonical(root),
-            "Invalid report folder.");
+    report = appSession.resume(report);
+    auto folder = reportFolder(root, report);
     session = std::make_unique<Session>();
     auto &s = *session;
     s.root = root;
@@ -239,15 +216,38 @@ bool resumePending()
     s.report = report;
     s.catalog = jsonRead(folder / L"catalog.json");
     s.profile = s.catalog.at("profiles").at(report.at("profile").get<std::string>());
-    s.before = read(folder / L"before.bin");
-    s.expected = read(folder / L"expected.bin");
-    require(hash(s.before) == report.at("before_sha256") &&
-                hash(s.expected) == report.at("expected_sha256"),
-            "The saved flash report has changed.");
+    if (report.value("write_started", false))
+    {
+        s.before = read(s.file("before.bin"));
+        s.expected = read(s.file("expected.bin"));
+        require(hash(s.before) == report.at("before_sha256") &&
+                    hash(s.expected) == report.at("expected_sha256"),
+                "The saved flash report has changed.");
+    }
+    s.package = fs::u8path(report.value("package", folders.at(selection(buildBox)).u8string()));
+    s.restoring = report.value("operation", "") == "restore";
+    if (s.restoring)
+        s.backup = loadBackup(fs::u8path(report.at("restore_source").get<std::string>()), s.catalog);
     s.fc = b == 0;
     s.serial = report.value("usb_serial", "");
     s.update = notify;
-    step = Step::Verify;
+    if (!s.fc && report.value("font_before_restore", false) &&
+        !report.value("write_started", false))
+    {
+        s.report["font_pending"] = false;
+        s.report["font_before_restore"] = false;
+        s.state("restore_connect", stepText(Step::Connect, "ec", true), 0);
+    }
+    if (s.fc && report.value("font_pending", false))
+    {
+        s.report["font_pending"] = false;
+        s.state(report.value("verified", false) ? "complete" : "needs_attention",
+                stepText(report.value("verified", false) ? Step::Complete : Step::Verify, "fc"),
+                report.value("verified", false) ? 100 : 85);
+    }
+    step = s.report.value("font_pending", false) ? Step::Font
+         : s.report.value("state", "") == "restore_connect" ? Step::Connect
+         : s.report.value("verified", false) ? Step::Complete : Step::Verify;
     prompt();
     return true;
 }
@@ -255,8 +255,22 @@ void flash()
 {
     if (step == Step::Idle)
     {
-        if (resumePending())
+        if (!restoreBackup && resumePending())
             return;
+        if (restoreBackup)
+        {
+            session = std::make_unique<Session>();
+            int n = selection(buildBox);
+            session->restore(appSession, folders.at(n), catalogs.at(n), *restoreBackup);
+            session->update = notify;
+            restoreBackup.reset();
+            if (session->report.value("font_pending", false))
+            {
+                step = Step::Font;
+                prompt();
+                return;
+            }
+        }
         step = Step::Connect;
         prompt();
         return;
@@ -279,18 +293,28 @@ void flash()
         run([] { session->verify(); }, Step::Complete);
         return;
     }
+    if (step == Step::Font)
+    {
+        run([] { session->uploadFont(); }, Step::Complete);
+        return;
+    }
     int n = selection(buildBox), b = selection(boardBox);
     require(n >= 0, "Select a build.");
     auto key = selectedProfile();
     auto path = folders.at(n);
     auto cat = catalogs.at(n);
-    session = std::make_unique<Session>();
-    session->update = notify;
-    session->fc = b == 0;
+    bool restoring = session && session->restoring;
+    if (!restoring)
+    {
+        session = std::make_unique<Session>();
+        session->update = notify;
+        session->fc = b == 0;
+    }
     run(
-        [path, cat, key, b]
+        [path, cat, key, b, restoring]
         {
-            session->start(path, cat, key, b == 0);
+            if (!restoring)
+                session->start(appSession, path, cat, key, b == 0);
             if (b != 1)
             {
                 auto devices = ports();
@@ -298,7 +322,7 @@ void flash()
                         "Disconnect other USB serial devices, then click to retry.");
                 if (devices.size() == 1)
                 {
-                    notify("Entering bootloader...", 3);
+                    notify("Entering bootloader...", -1);
                     enterBootloader(devices[0].name, b == 0);
                     std::this_thread::sleep_for(std::chrono::milliseconds(1800));
                 }
@@ -307,6 +331,29 @@ void flash()
             session->flash();
         },
         b == 0 ? Step::Complete : Step::Verify);
+}
+void chooseBackup()
+{
+    wchar_t file[32768] = {};
+    auto root = reportRoot().wstring();
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = win;
+    dialog.lpstrFilter = L"Firmware backup\0* backup.bin;before.bin\0";
+    dialog.lpstrFile = file;
+    dialog.nMaxFile = 32768;
+    dialog.lpstrInitialDir = root.c_str();
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog))
+        return;
+    require(selection(buildBox) >= 0, "Select a build first.");
+    auto backup = loadBackup(fs::path(file), catalogs.at(selection(buildBox)));
+    int board = backup.key.rfind("FC_", 0) == 0 ? 0 : backup.key.rfind("EC_", 0) == 0 ? 1 : 2;
+    SendMessageW(boardBox, CB_SETCURSEL, board, 0);
+    SendMessageW(cpuBox, CB_SETCURSEL, backup.key == "FC_F7" ? 1 : 2, 0);
+    SendMessageW(ledBox, CB_SETCURSEL, backup.key == "LED_C" ? 2 : 1, 0);
+    restoreBackup = std::make_unique<Backup>(std::move(backup));
+    flash();
 }
 void browse()
 {
@@ -379,6 +426,7 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             flashButton = control(L"BUTTON", L"Flash", 120, 370, 160, 44, FLASH,
                                   WS_TABSTOP | BS_OWNERDRAW | BS_MULTILINE);
             control(L"BUTTON", L"Reports", 24, 454, 82, 26, REPORTS, WS_TABSTOP);
+            control(L"BUTTON", L"Restore...", 294, 454, 82, 26, RESTORE, WS_TABSTOP);
             control(L"BUTTON", L"Back", 294, 454, 82, 26, BACK, WS_TABSTOP);
             auto root = exeDir() / L"builds";
             if (fs::exists(root))
@@ -393,6 +441,7 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             }
             if (!folders.empty())
                 SendMessageW(buildBox, CB_SETCURSEL, 0, 0);
+            SetTimer(h, 1, 40, nullptr);
             prompt();
             return 0;
         }
@@ -409,6 +458,18 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             EndPaint(h, &p);
             return 0;
         }
+        case WM_TIMER:
+            if (busy && percent < 0)
+                InvalidateRect(flashButton, nullptr, FALSE);
+            if (updatePending && !busy && (step == Step::Idle || step == Step::Complete))
+            {
+                updatePending = false;
+                showUpdateNotice(h);
+            }
+            return 0;
+        case UPDATE_AVAILABLE:
+            updatePending = true;
+            return 0;
         case WM_CTLCOLORSTATIC:
             SetBkColor(reinterpret_cast<HDC>(w), RGB(255, 255, 255));
             SetTextColor(reinterpret_cast<HDC>(w), RGB(35, 35, 35));
@@ -447,7 +508,15 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             {
                 RECT bar = d->rcItem;
                 bar.top = bar.bottom - px(4);
-                bar.right = bar.left + (bar.right - bar.left) * percent / 100;
+                auto width = bar.right - bar.left;
+                if (percent < 0)
+                {
+                    auto position = int(GetTickCount64() % 1600) * (width + px(70)) / 1600;
+                    bar.left = std::max<LONG>(0, position - px(70));
+                    bar.right = std::min<LONG>(width, position);
+                }
+                else
+                    bar.right = bar.left + width * percent / 100;
                 auto red = CreateSolidBrush(RGB(220, 15, 20));
                 FillRect(d->hDC, &bar, red);
                 DeleteObject(red);
@@ -476,7 +545,9 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             if (int(w) < 0)
             {
                 failed = true;
-                if (session && session->report.value("write_started", false))
+                if (session && session->report.value("font_pending", false))
+                    step = Step::Font;
+                else if (session && session->report.value("write_started", false))
                 {
                     step = Step::Verify;
                 }
@@ -485,6 +556,8 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             else
             {
                 step = Step(int(w));
+                if (session && session->report.value("font_pending", false))
+                    step = Step::Font;
                 prompt();
             }
             return 0;
@@ -505,12 +578,23 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             case BROWSE:
                 browse();
                 break;
+            case RESTORE:
+                chooseBackup();
+                break;
             case REPORTS:
-                ShellExecuteW(h, L"open", reportRoot().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                ShellExecuteW(h, L"open", appSession.folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                 break;
             case BACK:
+                if (session && !session->report.value("write_started", false) &&
+                    !session->report.contains("font_before_sha256"))
+                {
+                    session->report["font_pending"] = false;
+                    session->update = nullptr;
+                    session->state("cancelled", "No firmware written", 0);
+                }
                 step = Step::Idle;
                 session.reset();
+                restoreBackup.reset();
                 prompt();
                 break;
             }
@@ -521,6 +605,7 @@ LRESULT CALLBACK procedure(HWND h, UINT msg, WPARAM w, LPARAM l)
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
+            KillTimer(h, 1);
             saveUI(false);
             PostQuitMessage(0);
             return 0;
@@ -544,8 +629,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int show)
         {
             Json j;
             auto r = reportRoot();
-            if (fs::exists(r / L"ui.json"))
-                j["ui"] = jsonRead(r / L"ui.json");
+            j["ui"] = latestRecord(r, true);
             j["latest"] = latestReport(r);
             auto s = j.dump(2);
             DWORD n;
@@ -572,6 +656,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int show)
         return 0;
     }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    try
+    {
+        appSession.start(reportRoot());
+    }
+    catch (const std::exception &error)
+    {
+        MessageBoxW(nullptr, wide(error.what()).c_str(), L"DRL Flasher", MB_OK | MB_ICONERROR);
+        CloseHandle(mutex);
+        CoUninitialize();
+        return 1;
+    }
     Gdiplus::GdiplusStartupInput input;
     ULONG_PTR token;
     Gdiplus::GdiplusStartup(&token, &input, nullptr);
@@ -594,6 +689,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int show)
     DwmSetWindowAttribute(win, 35, &captionColor, sizeof(captionColor));
     DwmSetWindowAttribute(win, 36, &textColor, sizeof(textColor));
     ShowWindow(win, show);
+    auto updateWindow = win;
+    auto updateFolder = appSession.data();
+    updateWorker = std::thread([updateWindow, updateFolder] {
+        if (updateAvailable(updateFolder))
+            PostMessageW(updateWindow, UPDATE_AVAILABLE, 0, 0);
+    });
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
         if (!IsDialogMessageW(win, &msg))
@@ -603,6 +704,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int show)
         }
     if (worker.joinable())
         worker.join();
+    if (updateWorker.joinable())
+        updateWorker.join();
     header.reset();
     if (headerStream)
         headerStream->Release();

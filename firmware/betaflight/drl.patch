@@ -2042,7 +2042,7 @@ index 8b762af70c4bb04faae69958e991a3cb6aef7ee9..3aa58bbde33461c2dd389d7b2293ccc5
  #define PG_RESERVED_FOR_TESTING_2 4094
 diff --git a/src/main/target/RACER4F4/config.c b/src/main/target/RACER4F4/config.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..56f146174c9d3295b6caaff1a1f040e27b07af64
+index 0000000000000000000000000000000000000000..18e5cb970ee9c1db0c96cdc9802a345556174490
 --- /dev/null
 +++ b/src/main/target/RACER4F4/config.c
 @@ -0,0 +1,363 @@
@@ -2367,7 +2367,7 @@ index 0000000000000000000000000000000000000000..56f146174c9d3295b6caaff1a1f040e2
 +    ((uint8_t *)(pgFind(PG_PID_PROFILE)->address +
 +                 offsetof(pidProfile_t, abs_control_error_limit)))[0] =
 +        20;
-+    strcpy(pilotConfigMutable()->name, "leszczy");
++    pilotConfigMutable()->name[0] = 0;
 +    featureClearAll();
 +    featureSet(FEATURE_RX_SERIAL | FEATURE_TELEMETRY | FEATURE_OSD | FEATURE_DYNAMIC_FILTER);
 +    beeperConfigMutable()->beeper_off_flags =
@@ -2863,7 +2863,7 @@ index 0000000000000000000000000000000000000000..8d9ac70ca3e2c3beb2fbf6023b95d91b
 +            io/drl_led_rpc.c
 diff --git a/src/main/target/RACER4S/config.c b/src/main/target/RACER4S/config.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..74dad89c2ebc4e41279209541247d02b397250b5
+index 0000000000000000000000000000000000000000..bb15cbc894447381d88f9f7e7a9df353b747952c
 --- /dev/null
 +++ b/src/main/target/RACER4S/config.c
 @@ -0,0 +1,245 @@
@@ -3065,7 +3065,7 @@ index 0000000000000000000000000000000000000000..74dad89c2ebc4e41279209541247d02b
 +                 offsetof(controlRateConfig_t, rates[FD_YAW])))[0] = 70;
 +    ((uint8_t *)(pgFind(PG_PID_CONFIG)->address + offsetof(pidConfig_t, pid_process_denom)))[0] =
 +        4;
-+    strcpy(pilotConfigMutable()->name, "leszczy");
++    pilotConfigMutable()->name[0] = 0;
 +    featureClearAll();
 +    featureSet(FEATURE_RX_SERIAL | FEATURE_TELEMETRY | FEATURE_OSD | FEATURE_DYNAMIC_FILTER);
 +    beeperConfigMutable()->beeper_off_flags =
