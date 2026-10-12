@@ -1,6 +1,6 @@
 # DRL Racer4
 
-Custom firmware and tools for the DRL Racer4 developed by [@hackrfstuff](https://github.com/hackrfstuff), [@Mr-milky-way](https://github.com/Mr-milky-way), [@ZionFPV](https://github.com/ZionFPV), [@MayanHawk](https://github.com/MayanHawk).
+Custom firmware and tools for the DRL Racer4 developed by [@leszczy](https://github.com/hackrfstuff), [@Mr-milky-way](https://github.com/Mr-milky-way), [@ZionFPV](https://github.com/ZionFPV), [@MayanHawk](https://github.com/MayanHawk).
 
 Firmware for the F4 and F7 flight controllers, EC and LED controllers, with Betaflight OSD, LED patterns and GIF uploads. Also supports replacement cameras and SmartAudio VTX control.
 
