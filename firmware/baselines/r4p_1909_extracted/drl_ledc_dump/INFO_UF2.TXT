@@ -1,0 +1,3 @@
+UF2 Bootloader v3.7.0 SFHWRO
+Model: Metro M4 Express
+Board-ID: SAMD51J19A-Metro-v0
